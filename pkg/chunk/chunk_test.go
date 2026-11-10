@@ -2,13 +2,53 @@ package chunk_test
 
 import (
 	"bytes"
+	"io"
+	"math"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/bluenviron/gortmplib/pkg/chunk"
 )
+
+type truncatedChunkReader struct {
+	header       []byte
+	whenBodyRead uint64
+}
+
+func (r *truncatedChunkReader) Read(p []byte) (int, error) {
+	if len(r.header) > 0 {
+		n := copy(p, r.header)
+		r.header = r.header[n:]
+		return n, nil
+	}
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	r.whenBodyRead = stats.TotalAlloc
+	return 0, io.EOF
+}
+
+func TestLargeChunkHeaderDoesNotAllocateWholeBody(t *testing.T) {
+	wire, err := (chunk.Chunk0{ChunkStreamID: 2, BodyLen: 10 << 20, Type: 9}).Marshal(false)
+	require.NoError(t, err)
+	r := &truncatedChunkReader{header: wire}
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	var parsed chunk.Chunk0
+	require.ErrorIs(t, parsed.Read(r, 10<<20, false), io.EOF)
+	require.Less(t, r.whenBodyRead-before.TotalAlloc, uint64(1<<20), "a header alone must not allocate the declared body")
+}
+
+func TestMaximumChunkLengthDoesNotOverflowIncrementalRead(t *testing.T) {
+	r := &truncatedChunkReader{header: []byte{0xc2}}
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	var parsed chunk.Chunk3
+	require.ErrorIs(t, parsed.Read(r, math.MaxUint32, false), io.EOF)
+	require.Less(t, r.whenBodyRead-before.TotalAlloc, uint64(1<<20))
+}
 
 var cases = []struct {
 	name                 string

@@ -14,6 +14,124 @@ import (
 	"github.com/bluenviron/gortmplib/pkg/rawmessage"
 )
 
+func TestReaderBoundsIncompleteMessagesAcrossChunkStreams(t *testing.T) {
+	const chunkSize = 1 << 20
+	var wire bytes.Buffer
+	for stream := byte(2); stream < 19; stream++ {
+		part, err := (chunk.Chunk0{ChunkStreamID: stream, BodyLen: 2 * chunkSize, Type: 9, Body: bytes.Repeat([]byte{stream}, chunkSize)}).Marshal(false)
+		require.NoError(t, err)
+		_, err = wire.Write(part)
+		require.NoError(t, err)
+	}
+	r := &rawmessage.Reader{BR: &wire}
+	r.Initialize()
+	require.NoError(t, r.SetChunkSize(chunkSize))
+	_, err := r.Read()
+	require.ErrorContains(t, err, "incomplete message budget")
+}
+
+func TestReaderRejectsZeroChunkSize(t *testing.T) {
+	r := &rawmessage.Reader{BR: bytes.NewReader(nil)}
+	r.Initialize()
+	require.Error(t, r.SetChunkSize(0))
+}
+
+func TestReaderRejectsOverBudgetChunkBeforeBody(t *testing.T) {
+	const chunkSize = 1 << 20
+	var wire bytes.Buffer
+	for stream := byte(2); stream < 18; stream++ {
+		part, err := (chunk.Chunk0{ChunkStreamID: stream, BodyLen: 2 * chunkSize, Type: 9, Body: bytes.Repeat([]byte{stream}, chunkSize)}).Marshal(false)
+		require.NoError(t, err)
+		_, err = wire.Write(part)
+		require.NoError(t, err)
+	}
+	header, err := (chunk.Chunk0{ChunkStreamID: 18, BodyLen: 2 * chunkSize, Type: 9}).Marshal(false)
+	require.NoError(t, err)
+	_, err = wire.Write(header)
+	require.NoError(t, err)
+	r := &rawmessage.Reader{BR: &wire}
+	r.Initialize()
+	require.NoError(t, r.SetChunkSize(chunkSize))
+	_, err = r.Read()
+	require.ErrorContains(t, err, "incomplete message budget", "the reader must reject without waiting for the chunk body")
+}
+
+func TestReaderInitializeClearsIncompleteBudget(t *testing.T) {
+	const chunkSize = 1 << 20
+	var first bytes.Buffer
+	for stream := byte(2); stream < 18; stream++ {
+		part, err := (chunk.Chunk0{ChunkStreamID: stream, BodyLen: 2 * chunkSize, Type: 9, Body: bytes.Repeat([]byte{stream}, chunkSize)}).Marshal(false)
+		require.NoError(t, err)
+		_, err = first.Write(part)
+		require.NoError(t, err)
+	}
+	r := &rawmessage.Reader{BR: &first}
+	r.Initialize()
+	require.NoError(t, r.SetChunkSize(chunkSize))
+	_, err := r.Read()
+	require.ErrorIs(t, err, io.EOF)
+	part, err := (chunk.Chunk0{ChunkStreamID: 2, BodyLen: 2 * chunkSize, Type: 9, Body: bytes.Repeat([]byte{2}, chunkSize)}).Marshal(false)
+	require.NoError(t, err)
+	r.BR = bytes.NewReader(part)
+	r.Initialize()
+	require.NoError(t, r.SetChunkSize(chunkSize))
+	_, err = r.Read()
+	require.ErrorIs(t, err, io.EOF, "reinitialization must release the old budget")
+}
+
+func TestReaderReleasesIncompleteMessageBudgetOnAbort(t *testing.T) {
+	const chunkSize = 1 << 20
+	var wire bytes.Buffer
+	appendChunk := func(c chunk.Chunk) {
+		t.Helper()
+		part, err := c.Marshal(false)
+		require.NoError(t, err)
+		_, err = wire.Write(part)
+		require.NoError(t, err)
+	}
+	for stream := byte(2); stream < 18; stream++ {
+		appendChunk(&chunk.Chunk0{ChunkStreamID: stream, BodyLen: 2 * chunkSize, Type: 9, Body: bytes.Repeat([]byte{stream}, chunkSize)})
+	}
+	appendChunk(&chunk.Chunk0{ChunkStreamID: 30, BodyLen: 1, Type: 4, Body: []byte{1}})
+	for stream := byte(18); stream < 20; stream++ {
+		appendChunk(&chunk.Chunk0{ChunkStreamID: stream, BodyLen: 2 * chunkSize, Type: 9, Body: bytes.Repeat([]byte{stream}, chunkSize)})
+	}
+	appendChunk(&chunk.Chunk0{ChunkStreamID: 31, BodyLen: 1, Type: 4, Body: []byte{2}})
+	r := &rawmessage.Reader{BR: &wire}
+	r.Initialize()
+	require.NoError(t, r.SetChunkSize(chunkSize))
+	first, err := r.Read()
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, first.Body)
+	r.AbortChunkStream(2)
+	r.AbortChunkStream(3)
+	second, err := r.Read()
+	require.NoError(t, err)
+	require.Equal(t, []byte{2}, second.Body)
+}
+
+func TestReaderCompletesMessageAtFullIncompleteBudget(t *testing.T) {
+	const chunkSize = 1 << 20
+	var wire bytes.Buffer
+	for stream := byte(2); stream < 18; stream++ {
+		part, err := (chunk.Chunk0{ChunkStreamID: stream, BodyLen: 2 * chunkSize, Type: 9, Body: bytes.Repeat([]byte{stream}, chunkSize)}).Marshal(false)
+		require.NoError(t, err)
+		_, err = wire.Write(part)
+		require.NoError(t, err)
+	}
+	last, err := (chunk.Chunk3{ChunkStreamID: 2, Body: bytes.Repeat([]byte{2}, chunkSize)}).Marshal(false)
+	require.NoError(t, err)
+	_, err = wire.Write(last)
+	require.NoError(t, err)
+	r := &rawmessage.Reader{BR: &wire}
+	r.Initialize()
+	require.NoError(t, r.SetChunkSize(chunkSize))
+	message, err := r.Read()
+	require.NoError(t, err, "a complete message must be able to release a full budget")
+	require.Len(t, message.Body, 2*chunkSize)
+	require.Equal(t, bytes.Repeat([]byte{2}, 2*chunkSize), message.Body)
+}
+
 var cases = []struct {
 	name     string
 	messages []*rawmessage.Message

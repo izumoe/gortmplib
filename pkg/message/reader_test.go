@@ -16,6 +16,14 @@ import (
 	"github.com/bluenviron/gortmplib/pkg/message"
 )
 
+func TestReaderRejectsZeroChunkSizeMessage(t *testing.T) {
+	wire := []byte{0x02, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0}
+	r := &message.Reader{BR: bytes.NewReader(wire)}
+	r.Initialize()
+	_, err := r.Read()
+	require.ErrorContains(t, err, "chunk size must be positive")
+}
+
 var readWriterCases = []struct {
 	name string
 	dec  message.Message

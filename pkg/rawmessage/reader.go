@@ -14,15 +14,14 @@ import (
 var errMoreChunksNeeded = errors.New("more chunks are needed")
 
 const (
-	maxBodySize = 10 * 1024 * 1024
+	maxBodySize        = 10 * 1024 * 1024
+	maxIncompleteBytes = 16 * 1024 * 1024
 )
 
-func joinFragments(fragments [][]byte, size uint32) []byte {
+func joinFragments(fragments, final []byte, size uint32) []byte {
 	ret := make([]byte, size)
-	n := 0
-	for _, p := range fragments {
-		n += copy(ret[n:], p)
-	}
+	n := copy(ret, fragments)
+	copy(ret[n:], final)
 	return ret
 }
 
@@ -33,7 +32,7 @@ type readerChunkStream struct {
 	curType               uint8
 	curMessageStreamID    uint32
 	curBodyLen            uint32
-	curBodyFragments      [][]byte
+	curBody               []byte
 	curBodyRecv           uint32
 	curTimestampDelta     uint32
 	hasExtendedTimestamp  bool
@@ -41,8 +40,32 @@ type readerChunkStream struct {
 
 func (rc *readerChunkStream) abortMessage() {
 	rc.curBodyLen = 0
-	rc.curBodyFragments = rc.curBodyFragments[:0]
+	rc.releaseFragments()
+}
+
+func (rc *readerChunkStream) releaseFragments() {
+	rc.mr.incompleteBytes -= uint64(cap(rc.curBody))
+	rc.curBody = nil
 	rc.curBodyRecv = 0
+}
+
+func (rc *readerChunkStream) addFragment(body []byte) error {
+	needed := len(rc.curBody) + len(body)
+	if needed > cap(rc.curBody) {
+		available := int(maxIncompleteBytes - rc.mr.incompleteBytes + uint64(cap(rc.curBody)))
+		if needed > available {
+			return fmt.Errorf("incomplete message budget exceeded (%d bytes)", maxIncompleteBytes)
+		}
+		capacity := max(128, cap(rc.curBody)*2, needed)
+		capacity = min(capacity, int(rc.curBodyLen), available)
+		bodyBuffer := make([]byte, len(rc.curBody), capacity)
+		copy(bodyBuffer, rc.curBody)
+		rc.mr.incompleteBytes += uint64(capacity - cap(rc.curBody))
+		rc.curBody = bodyBuffer
+	}
+	rc.curBody = append(rc.curBody, body...)
+	rc.curBodyRecv += uint32(len(body))
+	return nil
 }
 
 func (rc *readerChunkStream) readChunk(c chunk.Chunk, bodySize uint32, hasExtendedTimestamp bool) error {
@@ -96,8 +119,9 @@ func (rc *readerChunkStream) readMessage(typ byte) (*Message, error) {
 		le := uint32(len(rc.mr.c0.Body))
 
 		if rc.mr.c0.BodyLen != le {
-			rc.curBodyFragments = append(rc.curBodyFragments, rc.mr.c0.Body)
-			rc.curBodyRecv = le
+			if err := rc.addFragment(rc.mr.c0.Body); err != nil {
+				return nil, err
+			}
 			return nil, errMoreChunksNeeded
 		}
 
@@ -134,8 +158,9 @@ func (rc *readerChunkStream) readMessage(typ byte) (*Message, error) {
 		le := uint32(len(rc.mr.c1.Body))
 
 		if rc.mr.c1.BodyLen != le {
-			rc.curBodyFragments = append(rc.curBodyFragments, rc.mr.c1.Body)
-			rc.curBodyRecv = le
+			if err := rc.addFragment(rc.mr.c1.Body); err != nil {
+				return nil, err
+			}
 			return nil, errMoreChunksNeeded
 		}
 
@@ -168,8 +193,9 @@ func (rc *readerChunkStream) readMessage(typ byte) (*Message, error) {
 		le := uint32(len(rc.mr.c2.Body))
 
 		if rc.curBodyLen != le {
-			rc.curBodyFragments = append(rc.curBodyFragments, rc.mr.c2.Body)
-			rc.curBodyRecv = le
+			if err := rc.addFragment(rc.mr.c2.Body); err != nil {
+				return nil, err
+			}
 			return nil, errMoreChunksNeeded
 		}
 
@@ -188,19 +214,22 @@ func (rc *readerChunkStream) readMessage(typ byte) (*Message, error) {
 				return nil, err
 			}
 
-			rc.curBodyFragments = append(rc.curBodyFragments, rc.mr.c3.Body)
-			rc.curBodyRecv += uint32(len(rc.mr.c3.Body))
-
-			if rc.curBodyLen != rc.curBodyRecv {
+			if rc.curBodyLen != rc.curBodyRecv+uint32(len(rc.mr.c3.Body)) {
+				if err := rc.addFragment(rc.mr.c3.Body); err != nil {
+					return nil, err
+				}
 				return nil, errMoreChunksNeeded
 			}
 
 			rc.mr.msg.Timestamp = time.Duration(rc.curTimestamp) * time.Millisecond
 			rc.mr.msg.Type = rc.curType
 			rc.mr.msg.MessageStreamID = rc.curMessageStreamID
-			rc.mr.msg.Body = joinFragments(rc.curBodyFragments, rc.curBodyRecv)
-			rc.curBodyFragments = rc.curBodyFragments[:0]
-			rc.curBodyRecv = 0
+			if len(rc.curBody)+len(rc.mr.c3.Body) <= cap(rc.curBody) {
+				rc.mr.msg.Body = append(rc.curBody, rc.mr.c3.Body...)
+			} else {
+				rc.mr.msg.Body = joinFragments(rc.curBody, rc.mr.c3.Body, rc.curBodyLen)
+			}
+			rc.releaseFragments()
 			return rc.mr.msg.clone(), nil
 		}
 
@@ -220,8 +249,9 @@ func (rc *readerChunkStream) readMessage(typ byte) (*Message, error) {
 		le := uint32(len(rc.mr.c3.Body))
 
 		if rc.curBodyLen != le {
-			rc.curBodyFragments = append(rc.curBodyFragments, rc.mr.c3.Body)
-			rc.curBodyRecv = le
+			if err := rc.addFragment(rc.mr.c3.Body); err != nil {
+				return nil, err
+			}
 			return nil, errMoreChunksNeeded
 		}
 
@@ -240,15 +270,16 @@ type Reader struct {
 	OnAckNeeded  func(uint32) error
 	LastAckCount uint32
 
-	bufr          *bufio.Reader
-	chunkSize     uint32
-	ackWindowSize uint32
-	msg           Message
-	c0            chunk.Chunk0
-	c1            chunk.Chunk1
-	c2            chunk.Chunk2
-	c3            chunk.Chunk3
-	chunkStreams  map[byte]*readerChunkStream
+	bufr            *bufio.Reader
+	chunkSize       uint32
+	ackWindowSize   uint32
+	msg             Message
+	c0              chunk.Chunk0
+	c1              chunk.Chunk1
+	c2              chunk.Chunk2
+	c3              chunk.Chunk3
+	chunkStreams    map[byte]*readerChunkStream
+	incompleteBytes uint64
 }
 
 // Initialize initializes the Reader.
@@ -256,6 +287,7 @@ func (r *Reader) Initialize() {
 	r.bufr = bufio.NewReader(r.BR)
 	r.chunkSize = 128
 	r.chunkStreams = make(map[byte]*readerChunkStream)
+	r.incompleteBytes = 0
 }
 
 // NewReader allocates a Reader.
@@ -277,6 +309,9 @@ func NewReader(
 
 // SetChunkSize sets the maximum chunk size.
 func (r *Reader) SetChunkSize(v uint32) error {
+	if v == 0 {
+		return fmt.Errorf("chunk size must be positive")
+	}
 	if v > maxBodySize {
 		return fmt.Errorf("chunk size (%d) exceeds maximum (%d)", v, maxBodySize)
 	}
@@ -326,6 +361,33 @@ func (r *Reader) Read() (*Message, error) {
 		}
 
 		r.bufr.UnreadByte() //nolint:errcheck
+		// The message length in a type 0 or 1 header is available before
+		// reading its body. Check the shared budget before allocating a chunk.
+		var bodyLen uint32
+		if typ == 0 || typ == 1 {
+			header, err := r.bufr.Peek(7)
+			if err != nil {
+				return nil, err
+			}
+			bodyLen = uint32(header[4])<<16 | uint32(header[5])<<8 | uint32(header[6])
+		} else {
+			bodyLen = rc.curBodyLen
+		}
+		remaining := bodyLen
+		if typ == 3 && rc.curBodyRecv != 0 {
+			remaining -= rc.curBodyRecv
+		}
+		chunkLen := min(remaining, r.chunkSize)
+		partial := bodyLen > r.chunkSize
+		if typ == 3 && rc.curBodyRecv != 0 {
+			partial = remaining > r.chunkSize
+		}
+		if partial {
+			needed := uint64(len(rc.curBody)) + uint64(chunkLen)
+			if needed > uint64(cap(rc.curBody)) && r.incompleteBytes+needed-uint64(cap(rc.curBody)) > maxIncompleteBytes {
+				return nil, fmt.Errorf("incomplete message budget exceeded (%d bytes)", maxIncompleteBytes)
+			}
+		}
 
 		msg, err := rc.readMessage(typ)
 		if err != nil {
